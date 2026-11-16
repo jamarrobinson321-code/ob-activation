@@ -101,6 +101,12 @@ jobs:
             fi
           done
 
+          # Fail loudly instead of quietly "succeeding" with nothing captured.
+          if [ ! -s "$WORK/out/clipboard.txt" ] && [ ! -s "$WORK/out/code-from-qr.txt" ]; then
+            echo "::error::No activation code captured. Grant the runner Accessibility permission (System Events click) and Screen Recording (screenshot) in System Settings > Privacy & Security, then re-run."
+            exit 1
+          fi
+
           echo "===== activation code ====="
           head -c 1000 "$WORK/out/clipboard.txt" 2>/dev/null || true
           echo
