@@ -1,0 +1,86 @@
+# One-time OpenBubbles activation on genuine Apple hardware (GitHub-hosted macOS runner).
+#
+# Run it by hand from the Actions tab, then read the code from the job log or the
+# "activation" artifact. The Mac is never needed again after this run.
+#
+# SECURITY NOTE: workflow logs and artifacts of a public repo are readable by anyone.
+# Treat the activation code as a credential - use it immediately, then delete this
+# repo (or the run) so the code cannot be reused.
+name: openbubbles-activate
+
+on:
+  workflow_dispatch:
+
+jobs:
+  activate:
+    runs-on: macos-latest
+    timeout-minutes: 25
+
+    steps:
+      - name: Download the generator
+        run: |
+          set -euo pipefail
+          curl -fSL -o generator.zip \
+            "https://github.com/OpenBubbles/Mac-Hardware-Info/releases/latest/download/Mac.Hardware.Info.zip"
+          unzip -o -q generator.zip -d app
+          echo "--- unzipped contents ---"
+          find app -maxdepth 3 -print
+          APP=$(find app -maxdepth 3 -name "*.app" -print -quit)
+          if [ -z "$APP" ]; then
+            echo "No .app found in the zip; see the listing above."
+            exit 1
+          fi
+          echo "APP=$APP" >> "$GITHUB_ENV"
+
+      - name: Allow the unsigned app to run
+        run: |
+          xattr -dr com.apple.quarantine "$APP" || true
+          codesign --force --deep --sign - "$APP" || true
+          sudo spctl --master-disable || true
+          softwareupdate --install-rosetta --agree-to-license || true
+
+      - name: Launch the generator
+        run: |
+          open "$APP"
+          sleep 20
+          pgrep -lf "Mac Hardware Info" || echo "(app process not found by name)"
+
+      - name: Capture the activation code
+        run: |
+          set -uo pipefail
+          mkdir -p out
+
+          # Path 1 - click "Copy Activation Code" via UI scripting and read the pasteboard.
+          # This needs Accessibility permission, which a fresh runner may not grant; it is
+          # allowed to fail, because path 2 below does not depend on it.
+          osascript -e 'tell application "System Events" to tell process "Mac Hardware Info" to click button "Copy Activation Code" of window 1' || true
+          sleep 3
+          pbpaste > out/clipboard.txt 2>/dev/null || true
+
+          # Path 2 - screenshot the window's QR code and decode it.
+          screencapture -x out/screen.png || true
+          sips -Z 2000 out/screen.png --out out/screen-big.png >/dev/null 2>&1 || true
+          brew install zbar >/dev/null 2>&1 || true
+          zbarimg --quiet --raw out/screen.png > out/qr.bin 2>/dev/null || \
+            zbarimg --quiet --raw out/screen-big.png > out/qr.bin 2>/dev/null || true
+          if [ -s out/qr.bin ]; then
+            base64 -i out/qr.bin > out/code-from-qr.txt
+          fi
+
+          echo "===== clipboard (copy button) ====="
+          head -c 400 out/clipboard.txt 2>/dev/null || true
+          echo
+          echo "===== activation code decoded from the on-screen QR ====="
+          cat out/code-from-qr.txt 2>/dev/null || echo "(no QR decoded - download the 'activation' artifact and read screen.png)"
+
+      - name: Upload capture
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: activation
+          path: out/
+          if-no-files-found: warn
+
+      - name: Close the app
+        if: always()
+        run: pkill -x "Mac Hardware Info" || true
