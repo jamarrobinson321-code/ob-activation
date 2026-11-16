@@ -1,0 +1,54 @@
+# TEMPORARY capture on a GitHub-HOSTED macOS runner.
+#
+# Hosted runners are Virtualization.framework VMs, so the payload carries
+# VirtualMac2,1 / board Mac-20000000 identifiers. Apple can reject those, and the
+# recommended route is the self-hosted physical Mac in activate.yml.
+# This exists only to print a complete, untruncated payload.
+name: openbubbles-activate-hosted
+
+on:
+  workflow_dispatch:
+
+jobs:
+  activate:
+    runs-on: macos-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Download and prepare the generator
+        run: |
+          set -euo pipefail
+          curl -fSL -o generator.zip "https://github.com/OpenBubbles/Mac-Hardware-Info/releases/latest/download/Mac.Hardware.Info.zip"
+          unzip -o -q generator.zip -d app
+          APP=$(find app -maxdepth 3 -name "*.app" -print -quit)
+          echo "APP=$APP" >> "$GITHUB_ENV"
+          xattr -dr com.apple.quarantine "$APP" || true
+          codesign --force --deep --sign - "$APP" || true
+          softwareupdate --install-rosetta --agree-to-license || true
+
+      - name: Launch the generator
+        run: |
+          open "$APP"
+          sleep 20
+
+      - name: Capture the full code
+        run: |
+          set -uo pipefail
+          osascript -e 'tell application "System Events" to tell process "Mac Hardware Info" to click button "Copy Activation Code" of window 1' || true
+          sleep 4
+          mkdir -p out
+          pbpaste > out/clipboard.txt 2>/dev/null || true
+          echo "captured chars: $(wc -c < out/clipboard.txt)"
+          if grep -Eq 'VmlydHVhbE1hYw|TWFjLTIwMDAwMDAw' out/clipboard.txt; then
+            echo "::warning::payload contains VirtualMac / Mac-20000000 identifiers (hosted-runner hardware, not a real Mac)."
+          fi
+          echo "===== CODE START ====="
+          cat out/clipboard.txt
+          echo
+          echo "===== CODE END ====="
+          echo "===== IDENTIFIERS ====="
+          base64 -D -i out/clipboard.txt 2>/dev/null | strings -n 4 || true
+
+      - name: Close the app
+        if: always()
+        run: pkill -x "Mac Hardware Info" || true
