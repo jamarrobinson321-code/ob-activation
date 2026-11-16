@@ -1,11 +1,12 @@
-# One-time OpenBubbles activation on genuine Apple hardware (GitHub-hosted macOS runner).
+# One-time OpenBubbles activation on GENUINE PHYSICAL Mac hardware.
 #
-# Run it by hand from the Actions tab, then read the code from the job log or the
-# "activation" artifact. The Mac is never needed again after this run.
+# GitHub-HOSTED macOS runners are Apple Virtualization.framework VMs: they report
+# model "VirtualMac2,1" and board "Mac-20000000". Apple flags those identifiers, so
+# the hosted route is abandoned. This workflow runs on a self-hosted runner instead:
+# register the real Mac under Settings > Actions > Runners (see the guide, step B2).
 #
-# SECURITY NOTE: workflow logs and artifacts of a public repo are readable by anyone.
-# Treat the activation code as a credential - use it immediately, then delete this
-# repo (or the run) so the code cannot be reused.
+# Two guards refuse to produce a code from virtual hardware: a hw.model pre-check
+# before the app is even downloaded, and a payload check before the code is printed.
 name: openbubbles-activate
 
 on:
@@ -13,21 +14,42 @@ on:
 
 jobs:
   activate:
-    runs-on: macos-latest
+    runs-on: self-hosted
     timeout-minutes: 25
 
     steps:
+      - name: Confirm the runner is a real Mac
+        run: |
+          set -euo pipefail
+          MODEL=$(sysctl -n hw.model)
+          BOARD=$(ioreg -rd1 -c IOPlatformExpertDevice | awk -F'"' '/board-id/{print $4; exit}')
+          echo "runner model: $MODEL"
+          echo "runner board: $BOARD"
+          case "$MODEL" in
+            VirtualMac*|VMware*|Parallels*|QEMU*|KVM*)
+              echo "::error::Runner reports '$MODEL', a virtual machine. Refusing to generate a code - Apple flags virtual hardware identifiers."
+              exit 1
+              ;;
+          esac
+          case "$BOARD" in
+            *20000000*)
+              echo "::error::Runner board-id is '$BOARD', a virtual placeholder. Refusing to generate a code."
+              exit 1
+              ;;
+          esac
+
       - name: Download the generator
         run: |
           set -euo pipefail
-          curl -fSL -o generator.zip \
+          WORK=$(mktemp -d)
+          echo "WORK=$WORK" >> "$GITHUB_ENV"
+          curl -fSL -o "$WORK/generator.zip" \
             "https://github.com/OpenBubbles/Mac-Hardware-Info/releases/latest/download/Mac.Hardware.Info.zip"
-          unzip -o -q generator.zip -d app
-          echo "--- unzipped contents ---"
-          find app -maxdepth 3 -print
-          APP=$(find app -maxdepth 3 -name "*.app" -print -quit)
+          unzip -o -q "$WORK/generator.zip" -d "$WORK/app"
+          find "$WORK/app" -maxdepth 3 -print
+          APP=$(find "$WORK/app" -maxdepth 3 -name "*.app" -print -quit)
           if [ -z "$APP" ]; then
-            echo "No .app found in the zip; see the listing above."
+            echo "::error::No .app found in the released zip."
             exit 1
           fi
           echo "APP=$APP" >> "$GITHUB_ENV"
@@ -36,51 +58,70 @@ jobs:
         run: |
           xattr -dr com.apple.quarantine "$APP" || true
           codesign --force --deep --sign - "$APP" || true
-          sudo spctl --master-disable || true
           softwareupdate --install-rosetta --agree-to-license || true
 
       - name: Launch the generator
         run: |
           open "$APP"
           sleep 20
-          pgrep -lf "Mac Hardware Info" || echo "(app process not found by name)"
+          pgrep -lf "Mac Hardware Info" || echo "::warning::app process not found by name"
 
       - name: Capture the activation code
         run: |
           set -uo pipefail
-          mkdir -p out
+          mkdir -p "$WORK/out"
 
-          # Path 1 - click "Copy Activation Code" via UI scripting and read the pasteboard.
-          # This needs Accessibility permission, which a fresh runner may not grant; it is
-          # allowed to fail, because path 2 below does not depend on it.
+          # Path 1 (primary) - click "Copy Activation Code" and read the pasteboard.
+          # This produced the byte-exact payload; the payload never reaches a file
+          # inside the app, so the pasteboard is the only lossless channel.
           osascript -e 'tell application "System Events" to tell process "Mac Hardware Info" to click button "Copy Activation Code" of window 1' || true
           sleep 3
-          pbpaste > out/clipboard.txt 2>/dev/null || true
+          pbpaste > "$WORK/out/clipboard.txt" 2>/dev/null || true
 
-          # Path 2 - screenshot the window's QR code and decode it.
-          screencapture -x out/screen.png || true
-          sips -Z 2000 out/screen.png --out out/screen-big.png >/dev/null 2>&1 || true
-          brew install zbar >/dev/null 2>&1 || true
-          zbarimg --quiet --raw out/screen.png > out/qr.bin 2>/dev/null || \
-            zbarimg --quiet --raw out/screen-big.png > out/qr.bin 2>/dev/null || true
-          if [ -s out/qr.bin ]; then
-            base64 -i out/qr.bin > out/code-from-qr.txt
+          # Path 2 (fallback) - screenshot the QR and decode binary-safe.
+          # -Sbinary stops zbar from UTF-8 munging the protobuf bytes (which turned
+          # 0xEC into C3 AC and broke the length prefix in the hosted run).
+          screencapture -x "$WORK/out/screen.png" || true
+          if command -v zbarimg >/dev/null 2>&1; then
+            zbarimg -q -Sbinary --raw "$WORK/out/screen.png" > "$WORK/out/qr.bin" 2>/dev/null || true
+            if [ -s "$WORK/out/qr.bin" ]; then
+              base64 -i "$WORK/out/qr.bin" > "$WORK/out/code-from-qr.txt"
+            fi
+          else
+            echo "::notice::zbarimg not installed (brew install zbar) - using the clipboard capture only."
           fi
 
-          echo "===== clipboard (copy button) ====="
-          head -c 400 out/clipboard.txt 2>/dev/null || true
+          # Guard: never let virtual-machine identifiers through, encoded or decoded.
+          # "VirtualMac" and "Mac-2000000" as they appear base64-encoded after the 6-byte OABS header.
+          for f in "$WORK/out/clipboard.txt" "$WORK/out/code-from-qr.txt"; do
+            [ -s "$f" ] || continue
+            if grep -Eq 'VmlydHVhbE1hYw|TWFjLTIwMDAwMDAw' "$f"; then
+              echo "::error::$f contains virtual-machine identifiers (VirtualMac / Mac-20000000). Not usable - do not submit this to Apple."
+              exit 1
+            fi
+          done
+
+          echo "===== activation code ====="
+          head -c 1000 "$WORK/out/clipboard.txt" 2>/dev/null || true
           echo
-          echo "===== activation code decoded from the on-screen QR ====="
-          cat out/code-from-qr.txt 2>/dev/null || echo "(no QR decoded - download the 'activation' artifact and read screen.png)"
+          echo "===== decoded identifiers ====="
+          if command -v base64 >/dev/null 2>&1; then
+            base64 -D -i "$WORK/out/clipboard.txt" 2>/dev/null | strings -n 4 || \
+              base64 -d "$WORK/out/clipboard.txt" 2>/dev/null | strings -n 4 || true
+          fi
+          echo
+          echo "Expected: a real model such as Macmini9,1 / MacBookPro18,x and a normal serial."
 
       - name: Upload capture
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: activation
-          path: out/
+          path: ${{ env.WORK }}/out/
           if-no-files-found: warn
 
-      - name: Close the app
+      - name: Close the app and clean up
         if: always()
-        run: pkill -x "Mac Hardware Info" || true
+        run: |
+          pkill -x "Mac Hardware Info" || true
+          [ -n "${WORK:-}" ] && rm -rf "$WORK" || true
